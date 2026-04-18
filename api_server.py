@@ -16,6 +16,7 @@ import zipfile
 from contextlib import asynccontextmanager
 from typing import Optional
 
+import anyio
 import httpx
 import uvicorn
 from fastapi import FastAPI, File, Form, Request, UploadFile, HTTPException
@@ -246,8 +247,8 @@ async def run_triage(anchor_bytes: bytes, crop_bytes_list: list[bytes], event_id
     n_images = 1 + len(crop_bytes_list)
 
     try:
-        anchor_uri = image_to_data_uri(anchor_bytes)
-        crop_uris = [image_to_data_uri(b) for b in crop_bytes_list]
+        anchor_uri = await anyio.to_thread.run_sync(image_to_data_uri, anchor_bytes)
+        crop_uris = [await anyio.to_thread.run_sync(image_to_data_uri, b) for b in crop_bytes_list]
 
         messages = build_messages(anchor_uri, crop_uris)
 

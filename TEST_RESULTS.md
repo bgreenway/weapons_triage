@@ -221,6 +221,47 @@ Tested three approaches to constraining the model's JSON output.
 
 ---
 
+## 11. Code Hardening & Async Image Processing
+
+Following two independent code reviews, the following fixes were applied and retested.
+
+### Fixes Applied
+
+| Issue | Fix |
+|-------|-----|
+| Boolean parsing (`bool("false")` is `True`) | Safe `parse_bool()` handles string values |
+| `/status` false healthy | `raise_for_status()`, verify metrics parsed, match label-less metrics |
+| PNG RGBA crash on JPEG save | Convert to RGB before encoding |
+| No upload size limits | 20MB per image, 50MB per zip, max 8 images per request |
+| Ambiguous input (anchor + package) | Reject with HTTP 400 |
+| Confidence out of range | Clamp to [0.0, 1.0] |
+| Synchronous image processing blocking event loop | `anyio.to_thread.run_sync` for CPU-bound Pillow operations |
+| Dead code | Removed unused V3_SCHEMA, camera_id parameter |
+
+### Post-Hardening Benchmark (labeled test set)
+
+| Metric | Value |
+|--------|-------|
+| Accuracy | 25/26 (96.2%) |
+| Average inference | 627ms |
+| Min | 425ms |
+| Max | 789ms |
+
+### Post-Hardening Stress Test (5,000 requests)
+
+| Metric | Value |
+|--------|-------|
+| Total requests | 5,000 |
+| Errors | 0 (0.00%) |
+| Avg wall clock per 100-request batch | 5.1s |
+| Avg latency | 3.5s |
+| Max latency | 5.0s |
+| KV cache after each iteration | 0.0 |
+
+No regression in accuracy. Slight improvement in latency due to async image processing freeing the event loop.
+
+---
+
 ## Summary
 
 | Metric | Value |
@@ -228,8 +269,8 @@ Tested three approaches to constraining the model's JSON output.
 | Accuracy (labeled test set) | 96.2% (100% for firearms only) |
 | False negative rate | 0% (no firearms missed across any test) |
 | False positive rate | ~0.5% on production data |
-| Single request latency | 350-650ms (production images) |
-| Throughput (concurrent) | ~18-20 req/s |
+| Single request latency | 425-789ms (production images) |
+| Throughput (concurrent) | ~20 req/s |
 | Stress test (5,000 requests) | 0 errors, 0 leaks |
 | Old system weapons missed | 5/5 caught by our model |
 | Old system AND-gate cases | 8/8 correctly clean without AND-gate |
