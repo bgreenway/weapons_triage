@@ -31,25 +31,6 @@ MODEL_NAME = os.environ.get("MODEL_NAME", "gemma-4-26b-a4b-it")
 MAX_IMAGE_DIM = 1920
 MAX_IMAGES_PER_REQUEST = 8
 
-# ---------- Structured output schema ----------
-
-V3_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "visibleWeapon": {"type": "boolean"},
-        "weaponTypes": {"type": "array", "items": {"type": "string"}},
-        "confidence": {"type": "number"},
-        "lawEnforcementIndicators": {"type": "boolean"},
-        "environmentType": {"type": "string"},
-        "personDescription": {"type": "string"},
-    },
-    "required": [
-        "visibleWeapon", "weaponTypes", "confidence",
-        "lawEnforcementIndicators", "environmentType", "personDescription",
-    ],
-    "additionalProperties": False,
-}
-
 # ---------- System prompts ----------
 
 PROMPT_SINGLE = """You are a visual weapons detection system.
@@ -120,8 +101,10 @@ class TriageResponse(BaseModel):
 # ---------- Image helpers ----------
 
 def image_to_data_uri(image_bytes: bytes) -> str:
-    """Resize if needed and return a base64 data URI."""
+    """Resize if needed, convert to RGB, and return a base64 data URI."""
     img = Image.open(io.BytesIO(image_bytes))
+    if img.mode not in ("RGB",):
+        img = img.convert("RGB")
     w, h = img.size
     if max(w, h) > MAX_IMAGE_DIM:
         if w > h:
@@ -157,6 +140,27 @@ def build_messages(anchor_uri: str, crop_uris: list[str]) -> list[dict]:
 
 # ---------- Response parsing ----------
 
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20MB per request
+MAX_ZIP_BYTES = 50 * 1024 * 1024     # 50MB per zip
+
+def parse_bool(value) -> bool:
+    """Safely parse a boolean from JSON that might return a string."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.lower() in ("true", "1", "yes")
+    return bool(value)
+
+def clamp_confidence(value) -> float:
+    """Parse confidence and clamp to [0.0, 1.0]."""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if not (0.0 <= f <= 1.0):
+        return max(0.0, min(1.0, f))
+    return f
+
 def parse_response(raw: str) -> dict:
     cleaned = raw.strip()
     if cleaned.startswith("```"):
@@ -165,10 +169,10 @@ def parse_response(raw: str) -> dict:
     parsed = json.loads(cleaned)
 
     return {
-        "visibleWeapon": bool(parsed.get("visibleWeapon", parsed.get("hasWeapon", False))),
+        "visibleWeapon": parse_bool(parsed.get("visibleWeapon", parsed.get("hasWeapon", False))),
         "weaponTypes": parsed.get("weaponTypes", []),
-        "confidence": float(parsed.get("confidence", 0.0)),
-        "lawEnforcementIndicators": bool(parsed.get("lawEnforcementIndicators", False)),
+        "confidence": clamp_confidence(parsed.get("confidence", 0.0)),
+        "lawEnforcementIndicators": parse_bool(parsed.get("lawEnforcementIndicators", False)),
         "environmentType": parsed.get("environmentType", "unknown"),
         "personDescription": parsed.get("personDescription", ""),
     }
@@ -201,11 +205,12 @@ async def health():
 async def status():
     try:
         resp = await app.state.http_client.get("/metrics")
+        resp.raise_for_status()
         metrics_text = resp.text
 
         def parse_metric(name):
             for line in metrics_text.split("\n"):
-                if line.startswith(name + "{"):
+                if line.startswith(name + "{") or line.startswith(name + " "):
                     return float(line.split()[-1])
             return None
 
@@ -213,8 +218,10 @@ async def status():
         waiting = parse_metric("vllm:num_requests_waiting")
         kv_cache = parse_metric("vllm:kv_cache_usage_perc")
 
+        healthy = running is not None  # metrics parsed successfully
+
         return {
-            "healthy": True,
+            "healthy": healthy,
             "requests_running": int(running) if running is not None else None,
             "requests_waiting": int(waiting) if waiting is not None else None,
             "kv_cache_usage": round(kv_cache, 3) if kv_cache is not None else None,
@@ -348,18 +355,31 @@ async def triage(
     crops: list[UploadFile] = File(default=[]),
     package: Optional[UploadFile] = File(default=None),
     event_id: str = Form(default=""),
-    camera_id: str = Form(default=""),
 ):
+    if package is not None and anchor is not None:
+        raise HTTPException(status_code=400, detail="Provide 'anchor' or 'package', not both")
+
     if package is not None:
-        # Zip input
         zip_bytes = await package.read()
+        if len(zip_bytes) > MAX_ZIP_BYTES:
+            raise HTTPException(status_code=413, detail=f"Zip file exceeds {MAX_ZIP_BYTES // (1024*1024)}MB limit")
         anchor_bytes, crop_bytes_list = extract_images_from_zip(zip_bytes)
+        if len(crop_bytes_list) + 1 > MAX_IMAGES_PER_REQUEST:
+            raise HTTPException(status_code=400, detail=f"Too many images: {len(crop_bytes_list) + 1} exceeds limit of {MAX_IMAGES_PER_REQUEST}")
         return await run_triage(anchor_bytes, crop_bytes_list, event_id)
 
     if anchor is not None:
-        # Form-data input
         anchor_bytes = await anchor.read()
-        crop_bytes_list = [await c.read() for c in crops]
+        if len(anchor_bytes) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail=f"Anchor image exceeds {MAX_UPLOAD_BYTES // (1024*1024)}MB limit")
+        if 1 + len(crops) > MAX_IMAGES_PER_REQUEST:
+            raise HTTPException(status_code=400, detail=f"Too many images: {1 + len(crops)} exceeds limit of {MAX_IMAGES_PER_REQUEST}")
+        crop_bytes_list = []
+        for c in crops:
+            cb = await c.read()
+            if len(cb) > MAX_UPLOAD_BYTES:
+                raise HTTPException(status_code=413, detail=f"Crop image exceeds {MAX_UPLOAD_BYTES // (1024*1024)}MB limit")
+            crop_bytes_list.append(cb)
         return await run_triage(anchor_bytes, crop_bytes_list, event_id)
 
     raise HTTPException(status_code=400, detail="Provide either 'anchor' (with optional 'crops') or 'package' (zip file)")
@@ -371,6 +391,8 @@ async def triage_image(request: Request, event_id: Optional[str] = None):
     body = await request.body()
     if not body:
         raise HTTPException(status_code=400, detail="Empty request body")
+    if len(body) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail=f"Image exceeds {MAX_UPLOAD_BYTES // (1024*1024)}MB limit")
     return await run_triage(body, [], event_id or "")
 
 if __name__ == "__main__":
