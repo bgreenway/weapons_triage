@@ -63,45 +63,133 @@ print(response.choices[0].message.content)
 
 ## 3. Weapons Triage Endpoint
 
-**URL:** http://192.168.1.201:8001/v1/triage
+This endpoint analyzes security camera images for visible weapons. There are three ways to submit images, all returning the same structured JSON response.
 
-This endpoint analyzes security camera images for visible weapons. It accepts multipart form data and returns structured JSON.
+---
 
-### Fields
+### Method 1: Form-Data (anchor + crops)
+
+**URL:** `POST http://192.168.1.201:8001/v1/triage`
+
+Submit images as individual multipart form fields. The `anchor` is the full scene image. The `crops` are optional cropped views of a detected person, typically captured at ~100ms intervals.
 
 | Field      | Type   | Required | Description                              |
 |------------|--------|----------|------------------------------------------|
 | `anchor`   | file   | Yes      | Full scene image from the camera         |
-| `crops`    | file(s)| No       | Cropped images of a detected person      |
+| `crops`    | file(s)| No       | Cropped images of a detected person (repeat field for multiple) |
 | `event_id` | string | No       | Your event identifier (auto-generated if omitted) |
 | `camera_id`| string | No       | Camera identifier for logging            |
 
-### Example: Single image
+**Single image (anchor only):**
 
 ```bash
 curl -X POST http://192.168.1.201:8001/v1/triage \
   -F "anchor=@scene.jpg"
 ```
 
-### Example: Anchor + cropped images
+**Anchor + cropped images:**
 
 ```bash
 curl -X POST http://192.168.1.201:8001/v1/triage \
   -F "anchor=@scene.jpg" \
-  -F "crops=@crop1.jpg" \
-  -F "crops=@crop2.jpg" \
-  -F "crops=@crop3.jpg"
+  -F "crops=@C1.jpg" \
+  -F "crops=@C2.jpg" \
+  -F "crops=@C3.jpg" \
+  -F "crops=@C4.jpg" \
+  -F "crops=@C5.jpg"
 ```
 
-### Example: With event and camera IDs
+**With event and camera IDs:**
 
 ```bash
 curl -X POST http://192.168.1.201:8001/v1/triage \
   -F "anchor=@scene.jpg" \
-  -F "crops=@crop1.jpg" \
+  -F "crops=@C1.jpg" \
+  -F "crops=@C2.jpg" \
   -F "event_id=evt-001" \
   -F "camera_id=lobby-cam-3"
 ```
+
+---
+
+### Method 2: Zip Package
+
+**URL:** `POST http://192.168.1.201:8001/v1/triage`
+
+Submit all images in a single zip file. The endpoint automatically identifies the anchor and crops based on filename conventions and ignores annotation files.
+
+| Field      | Type   | Required | Description                              |
+|------------|--------|----------|------------------------------------------|
+| `package`  | file   | Yes      | Zip file containing the images           |
+| `event_id` | string | No       | Your event identifier (auto-generated if omitted) |
+| `camera_id`| string | No       | Camera identifier for logging            |
+
+**Filename conventions inside the zip:**
+
+| Pattern | Role | Examples |
+|---------|------|----------|
+| `O.jpg` or `*_O.jpg` | **Anchor** (required) | `O.jpg`, `2026-04-07T16-00-20_cam1_O.jpg` |
+| `C1.jpg`, `C2.jpg`, ... or `*_C1.jpg`, `*_C2.jpg`, ... | **Crops** (optional) | `C1.jpg`, `2026-04-07T16-00-20_cam1_C1.jpg` |
+| `A.jpg` or `*_A.jpg` | **Annotation** (ignored) | `A.jpg`, `2026-04-07T16-00-20_cam1_A.jpg` |
+| Anything else | Ignored | `metadata.json`, `README.txt` |
+
+- The zip must contain exactly one anchor image (`O.jpg` or `*_O.jpg`)
+- Crops are sorted by filename, so `C1` is processed before `C2`, etc.
+- Annotation images (`_A.jpg`) are automatically skipped -- they contain bounding boxes and zoomed views meant for human review, not model input
+- Supported image formats: `.jpg`, `.jpeg`, `.png`
+- Filenames are matched case-insensitively
+
+**Example:**
+
+```bash
+curl -X POST http://192.168.1.201:8001/v1/triage \
+  -F "package=@event_bundle.zip"
+```
+
+**Example zip contents:**
+
+```
+event_bundle.zip
+├── 2026-04-07T16-00-20-030Z_cam1_O.jpg    (anchor - used)
+├── 2026-04-07T16-00-20-030Z_cam1_C1.jpg   (crop 1 - used)
+├── 2026-04-07T16-00-20-130Z_cam1_C2.jpg   (crop 2 - used)
+├── 2026-04-07T16-00-20-230Z_cam1_C3.jpg   (crop 3 - used)
+├── 2026-04-07T16-00-20-330Z_cam1_C4.jpg   (crop 4 - used)
+├── 2026-04-07T16-00-20-430Z_cam1_C5.jpg   (crop 5 - used)
+├── 2026-04-07T16-00-20-030Z_cam1_A.jpg    (annotation - skipped)
+└── metadata.json                           (ignored)
+```
+
+---
+
+### Method 3: Raw Image
+
+**URL:** `POST http://192.168.1.201:8001/v1/triage/image`
+
+Submit a single image as the raw request body. This is the simplest integration -- no multipart encoding, no zip, just the image bytes. Useful for quick single-frame checks.
+
+| Parameter  | Location | Required | Description                              |
+|------------|----------|----------|------------------------------------------|
+| Body       | body     | Yes      | Raw image bytes (JPEG or PNG)            |
+| `event_id` | query    | No       | Your event identifier (auto-generated if omitted) |
+
+**Example:**
+
+```bash
+curl -X POST http://192.168.1.201:8001/v1/triage/image \
+  -H "Content-Type: image/jpeg" \
+  --data-binary @scene.jpg
+```
+
+**With event ID:**
+
+```bash
+curl -X POST "http://192.168.1.201:8001/v1/triage/image?event_id=evt-001" \
+  -H "Content-Type: image/jpeg" \
+  --data-binary @scene.jpg
+```
+
+**Note:** This method only supports a single image (no crops). For best accuracy, use Method 1 or Method 2 with an anchor and multiple crops.
 
 ### Response format
 

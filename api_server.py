@@ -9,14 +9,16 @@ import io
 import json
 import logging
 import os
+import re
 import time
 import uuid
+import zipfile
 from contextlib import asynccontextmanager
 from typing import Optional
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException
+from fastapi import FastAPI, File, Form, Request, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 from pydantic import BaseModel
@@ -65,7 +67,8 @@ Rules:
 
 Always complete all fields, even if no weapon is detected. The confidence field represents your confidence in your conclusion, whether that conclusion is weapon or clean.
 
-Return JSON only."""
+You MUST return a JSON object with exactly these fields:
+{"visibleWeapon": bool, "weaponTypes": [strings], "confidence": float, "lawEnforcementIndicators": bool, "environmentType": string, "personDescription": string}"""
 
 PROMPT_MULTI = """You are a visual weapons detection system.
 
@@ -88,7 +91,8 @@ Rules:
 
 Always complete all fields, even if no weapon is detected. The confidence field represents your confidence in your conclusion, whether that conclusion is weapon or clean.
 
-Return JSON only."""
+You MUST return a JSON object with exactly these fields:
+{"visibleWeapon": bool, "weaponTypes": [strings], "confidence": float, "lawEnforcementIndicators": bool, "environmentType": string, "personDescription": string}"""
 
 USER_PROMPT_SINGLE = "Analyze this security camera image for potential weapons."
 USER_PROMPT_MULTI = (
@@ -159,6 +163,7 @@ def parse_response(raw: str) -> dict:
         lines = [l for l in cleaned.split("\n") if not l.strip().startswith("```")]
         cleaned = "\n".join(lines).strip()
     parsed = json.loads(cleaned)
+
     return {
         "visibleWeapon": bool(parsed.get("visibleWeapon", parsed.get("hasWeapon", False))),
         "weaponTypes": parsed.get("weaponTypes", []),
@@ -225,22 +230,17 @@ async def status():
             "error": str(e),
         }
 
-@app.post("/v1/triage", response_model=TriageResponse)
-async def triage(
-    anchor: UploadFile = File(...),
-    crops: list[UploadFile] = File(default=[]),
-    event_id: str = Form(default=""),
-    camera_id: str = Form(default=""),
-):
+async def run_triage(anchor_bytes: bytes, crop_bytes_list: list[bytes], event_id: str) -> TriageResponse:
+    """Shared inference logic for both form-data and zip inputs."""
     if not event_id:
         event_id = str(uuid.uuid4())[:8]
 
     start = time.time()
-    n_images = 1 + len(crops)
+    n_images = 1 + len(crop_bytes_list)
 
     try:
-        anchor_uri = image_to_data_uri(await anchor.read())
-        crop_uris = [image_to_data_uri(await c.read()) for c in crops]
+        anchor_uri = image_to_data_uri(anchor_bytes)
+        crop_uris = [image_to_data_uri(b) for b in crop_bytes_list]
 
         messages = build_messages(anchor_uri, crop_uris)
 
@@ -250,17 +250,11 @@ async def triage(
             "temperature": 0,
             "max_tokens": 512,
             "response_format": {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "triage_result",
-                    "strict": True,
-                    "schema": V3_SCHEMA,
-                },
+                "type": "json_object",
             },
         }
 
         last_error = None
-        raw_text = None
 
         for attempt in range(2):
             resp = await app.state.http_client.post(
@@ -318,6 +312,66 @@ async def triage(
             inference_time_ms=elapsed_ms,
             images_used=n_images,
         )
+
+
+def extract_images_from_zip(zip_bytes: bytes) -> tuple[bytes, list[bytes]]:
+    """Extract anchor and crops from a zip file.
+    Anchor: filename ending in _O.jpg or O.jpg
+    Crops: filenames ending in _C1.jpg, _C2.jpg, etc. or C1.jpg, C2.jpg, etc.
+    Skips: _A.jpg (annotations) and anything else
+    """
+    anchor = None
+    crops = []
+
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        names = sorted(zf.namelist())
+        for name in names:
+            basename = os.path.basename(name).lower()
+            if not basename.endswith(".jpg") and not basename.endswith(".jpeg") and not basename.endswith(".png"):
+                continue
+            if basename == "o.jpg" or basename.endswith("_o.jpg"):
+                anchor = zf.read(name)
+            elif re.match(r"(.*_)?c\d+\.jpe?g$", basename):
+                crops.append((basename, zf.read(name)))
+
+    if anchor is None:
+        raise HTTPException(status_code=400, detail="Zip file must contain an anchor image (O.jpg or *_O.jpg)")
+
+    # Sort crops by name to maintain order (C1, C2, C3...)
+    crops.sort(key=lambda x: x[0])
+    return anchor, [data for _, data in crops]
+
+
+@app.post("/v1/triage", response_model=TriageResponse)
+async def triage(
+    anchor: Optional[UploadFile] = File(default=None),
+    crops: list[UploadFile] = File(default=[]),
+    package: Optional[UploadFile] = File(default=None),
+    event_id: str = Form(default=""),
+    camera_id: str = Form(default=""),
+):
+    if package is not None:
+        # Zip input
+        zip_bytes = await package.read()
+        anchor_bytes, crop_bytes_list = extract_images_from_zip(zip_bytes)
+        return await run_triage(anchor_bytes, crop_bytes_list, event_id)
+
+    if anchor is not None:
+        # Form-data input
+        anchor_bytes = await anchor.read()
+        crop_bytes_list = [await c.read() for c in crops]
+        return await run_triage(anchor_bytes, crop_bytes_list, event_id)
+
+    raise HTTPException(status_code=400, detail="Provide either 'anchor' (with optional 'crops') or 'package' (zip file)")
+
+
+@app.post("/v1/triage/image", response_model=TriageResponse)
+async def triage_image(request: Request, event_id: Optional[str] = None):
+    """Accept a single raw image (POST body is the image bytes)."""
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="Empty request body")
+    return await run_triage(body, [], event_id or "")
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
