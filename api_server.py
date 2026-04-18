@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+"""
+FastAPI triage server for Gemma-4-26B.
+Lightweight HTTP client -- sends requests to vLLM's OpenAI-compatible API.
+"""
+
+import base64
+import io
+import json
+import logging
+import os
+import time
+import uuid
+from contextlib import asynccontextmanager
+from typing import Optional
+
+import httpx
+import uvicorn
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from PIL import Image
+from pydantic import BaseModel
+
+logger = logging.getLogger("api_server")
+
+VLLM_BASE_URL = os.environ.get("VLLM_BASE_URL", "http://gemma4:8000")
+MODEL_NAME = os.environ.get("MODEL_NAME", "gemma-4-26b-a4b-it")
+
+MAX_IMAGE_DIM = 1920
+MAX_IMAGES_PER_REQUEST = 8
+
+# ---------- Structured output schema ----------
+
+V3_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "visibleWeapon": {"type": "boolean"},
+        "weaponTypes": {"type": "array", "items": {"type": "string"}},
+        "confidence": {"type": "number"},
+        "lawEnforcementIndicators": {"type": "boolean"},
+        "environmentType": {"type": "string"},
+        "personDescription": {"type": "string"},
+    },
+    "required": [
+        "visibleWeapon", "weaponTypes", "confidence",
+        "lawEnforcementIndicators", "environmentType", "personDescription",
+    ],
+    "additionalProperties": False,
+}
+
+# ---------- System prompts ----------
+
+PROMPT_SINGLE = """You are a visual weapons detection system.
+
+You are given one image from a security camera detection event.
+
+Your task is to determine if a weapon is visibly present.
+
+Rules:
+- A weapon must be reported if it is clearly visible
+- Partial visibility is acceptable if the object matches a weapon profile
+- Do NOT infer weapons from clothing, role, or environment
+- A holstered weapon is NOT a visible weapon unless the weapon itself is clearly visible outside the holster
+- lawEnforcementIndicators is advisory only and must not influence visibleWeapon
+
+Always complete all fields, even if no weapon is detected. The confidence field represents your confidence in your conclusion, whether that conclusion is weapon or clean.
+
+Return JSON only."""
+
+PROMPT_MULTI = """You are a visual weapons detection system.
+
+You are given multiple images from the same event.
+Image 1 is the full scene at the time of detection.
+All other images are cropped views of the SAME person across nearby frames.
+
+Your task is to determine if a weapon is visibly present.
+
+Rules:
+- A weapon must be reported if it is clearly visible in ANY cropped image
+- A single clear frame is sufficient
+- Partial visibility is acceptable if the object matches a weapon profile
+- Evaluate each cropped image independently and focus on the clearest evidence
+- Ignore blurry or unclear frames
+- Do NOT infer weapons from clothing, role, or environment
+- Do NOT suppress a detection because other frames do not show a weapon
+- A holstered weapon is NOT a visible weapon unless the weapon itself is clearly visible outside the holster
+- lawEnforcementIndicators is advisory only and must not influence visibleWeapon
+
+Always complete all fields, even if no weapon is detected. The confidence field represents your confidence in your conclusion, whether that conclusion is weapon or clean.
+
+Return JSON only."""
+
+USER_PROMPT_SINGLE = "Analyze this security camera image for potential weapons."
+USER_PROMPT_MULTI = (
+    "Analyze these security camera images for potential weapons. "
+    "Image 1 is the full scene; remaining images are cropped views of "
+    "the detected person across nearby frames."
+)
+
+# ---------- Response models ----------
+
+class TriageResponse(BaseModel):
+    event_id: str
+    visible_weapon: bool = False
+    weapon_types: list[str] = []
+    confidence: float = 0.0
+    law_enforcement: bool = False
+    environment_type: str = "unknown"
+    person_description: str = ""
+    should_alert: bool = False
+    requires_review: bool = False
+    error: Optional[str] = None
+    inference_time_ms: float = 0.0
+    images_used: int = 0
+
+# ---------- Image helpers ----------
+
+def image_to_data_uri(image_bytes: bytes) -> str:
+    """Resize if needed and return a base64 data URI."""
+    img = Image.open(io.BytesIO(image_bytes))
+    w, h = img.size
+    if max(w, h) > MAX_IMAGE_DIM:
+        if w > h:
+            new_w, new_h = MAX_IMAGE_DIM, int(h * MAX_IMAGE_DIM / w)
+        else:
+            new_h, new_w = MAX_IMAGE_DIM, int(w * MAX_IMAGE_DIM / h)
+        img = img.resize((new_w, new_h), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=90)
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    return f"data:image/jpeg;base64,{b64}"
+
+# ---------- Message construction ----------
+
+def build_messages(anchor_uri: str, crop_uris: list[str]) -> list[dict]:
+    if crop_uris:
+        content = [{"type": "image_url", "image_url": {"url": anchor_uri}}]
+        for uri in crop_uris:
+            content.append({"type": "image_url", "image_url": {"url": uri}})
+        content.append({"type": "text", "text": USER_PROMPT_MULTI})
+        system_prompt = PROMPT_MULTI
+    else:
+        content = [
+            {"type": "image_url", "image_url": {"url": anchor_uri}},
+            {"type": "text", "text": USER_PROMPT_SINGLE},
+        ]
+        system_prompt = PROMPT_SINGLE
+
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": content},
+    ]
+
+# ---------- Response parsing ----------
+
+def parse_response(raw: str) -> dict:
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        lines = [l for l in cleaned.split("\n") if not l.strip().startswith("```")]
+        cleaned = "\n".join(lines).strip()
+    parsed = json.loads(cleaned)
+    return {
+        "visibleWeapon": bool(parsed.get("visibleWeapon", parsed.get("hasWeapon", False))),
+        "weaponTypes": parsed.get("weaponTypes", []),
+        "confidence": float(parsed.get("confidence", 0.0)),
+        "lawEnforcementIndicators": bool(parsed.get("lawEnforcementIndicators", False)),
+        "environmentType": parsed.get("environmentType", "unknown"),
+        "personDescription": parsed.get("personDescription", ""),
+    }
+
+# ---------- App ----------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.http_client = httpx.AsyncClient(
+        base_url=VLLM_BASE_URL,
+        timeout=60.0,
+    )
+    logger.info(f"Triage server ready, vLLM backend: {VLLM_BASE_URL}")
+    yield
+    await app.state.http_client.aclose()
+
+app = FastAPI(lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "model": MODEL_NAME, "backend": VLLM_BASE_URL}
+
+@app.get("/status")
+async def status():
+    try:
+        resp = await app.state.http_client.get("/metrics")
+        metrics_text = resp.text
+
+        def parse_metric(name):
+            for line in metrics_text.split("\n"):
+                if line.startswith(name + "{"):
+                    return float(line.split()[-1])
+            return None
+
+        running = parse_metric("vllm:num_requests_running")
+        waiting = parse_metric("vllm:num_requests_waiting")
+        kv_cache = parse_metric("vllm:kv_cache_usage_perc")
+
+        return {
+            "healthy": True,
+            "requests_running": int(running) if running is not None else None,
+            "requests_waiting": int(waiting) if waiting is not None else None,
+            "kv_cache_usage": round(kv_cache, 3) if kv_cache is not None else None,
+            "model": MODEL_NAME,
+        }
+    except Exception as e:
+        return {
+            "healthy": False,
+            "requests_running": None,
+            "requests_waiting": None,
+            "kv_cache_usage": None,
+            "model": MODEL_NAME,
+            "error": str(e),
+        }
+
+@app.post("/v1/triage", response_model=TriageResponse)
+async def triage(
+    anchor: UploadFile = File(...),
+    crops: list[UploadFile] = File(default=[]),
+    event_id: str = Form(default=""),
+    camera_id: str = Form(default=""),
+):
+    if not event_id:
+        event_id = str(uuid.uuid4())[:8]
+
+    start = time.time()
+    n_images = 1 + len(crops)
+
+    try:
+        anchor_uri = image_to_data_uri(await anchor.read())
+        crop_uris = [image_to_data_uri(await c.read()) for c in crops]
+
+        messages = build_messages(anchor_uri, crop_uris)
+
+        payload = {
+            "model": MODEL_NAME,
+            "messages": messages,
+            "temperature": 0,
+            "max_tokens": 512,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "triage_result",
+                    "strict": True,
+                    "schema": V3_SCHEMA,
+                },
+            },
+        }
+
+        last_error = None
+        raw_text = None
+
+        for attempt in range(2):
+            resp = await app.state.http_client.post(
+                "/v1/chat/completions",
+                json=payload,
+            )
+
+            elapsed_ms = (time.time() - start) * 1000
+
+            if resp.status_code != 200:
+                last_error = f"vLLM returned {resp.status_code}: {resp.text}"
+                continue
+
+            raw_text = resp.json()["choices"][0]["message"]["content"]
+
+            try:
+                parsed = parse_response(raw_text)
+            except (json.JSONDecodeError, KeyError, ValueError) as e:
+                last_error = f"Parse failed (attempt {attempt + 1}): {e} | raw: {raw_text}"
+                logger.warning(last_error)
+                continue
+
+            return TriageResponse(
+                event_id=event_id,
+                visible_weapon=parsed["visibleWeapon"],
+                weapon_types=parsed["weaponTypes"],
+                confidence=parsed["confidence"],
+                law_enforcement=parsed["lawEnforcementIndicators"],
+                environment_type=parsed["environmentType"],
+                person_description=parsed["personDescription"],
+                should_alert=parsed["visibleWeapon"],
+                inference_time_ms=elapsed_ms,
+                images_used=n_images,
+            )
+
+        # Both attempts failed
+        elapsed_ms = (time.time() - start) * 1000
+        return TriageResponse(
+            event_id=event_id,
+            should_alert=True,
+            requires_review=True,
+            error=last_error,
+            inference_time_ms=elapsed_ms,
+            images_used=n_images,
+        )
+
+    except Exception as e:
+        elapsed_ms = (time.time() - start) * 1000
+        logger.error(f"Triage error: {e}")
+        return TriageResponse(
+            event_id=event_id,
+            should_alert=True,
+            requires_review=True,
+            error=str(e),
+            inference_time_ms=elapsed_ms,
+            images_used=n_images,
+        )
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    uvicorn.run(app, host="0.0.0.0", port=8001)

@@ -1,0 +1,71 @@
+services:
+  gemma4:
+    image: vllm/vllm-openai:gemma4
+    container_name: gemma4-26b
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ~/gemma-4-26B-A4B-it:/models/gemma-4-26B-A4B-it:ro
+    shm_size: '32G'
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: >
+      --model /models/gemma-4-26B-A4B-it
+      --served-model-name gemma-4-26b-a4b-it
+      --tensor-parallel-size 4
+      --gpu-memory-utilization 0.90
+      --max-model-len 16384
+      --max-num-seqs 64
+      --enable-chunked-prefill
+      --trust-remote-code
+      --host 0.0.0.0
+      --port 8000
+      --dtype bfloat16
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
+
+  triage:
+    build:
+      context: .
+      dockerfile: Dockerfile.triage
+      network: host
+    container_name: gemma4-triage
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    environment:
+      - VLLM_BASE_URL=http://gemma4:8000
+      - MODEL_NAME=gemma-4-26b-a4b-it
+    depends_on:
+      gemma4:
+        condition: service_healthy
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - OPENAI_API_BASE_URL=http://gemma4:8000/v1
+      - OPENAI_API_KEY=dummy
+      - DEFAULT_MODELS=gemma-4-26b-a4b-it
+    volumes:
+      - open-webui-data:/app/backend/data
+    depends_on:
+      gemma4:
+        condition: service_healthy
+
+volumes:
+  open-webui-data:
